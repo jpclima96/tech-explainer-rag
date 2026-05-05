@@ -8,3 +8,8 @@ dist/
 build/
 *.egg-info/
 .env
+
+# Frontend
+fact-checker-ui/node_modules/
+fact-checker-ui/dist/
+fact-checker-ui/.env.local
