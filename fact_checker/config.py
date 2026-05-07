@@ -11,11 +11,11 @@ class Settings(BaseSettings):
 
     anthropic_api_key: str = "placeholder"
     tavily_api_key: str = "placeholder"
-    default_model: str = "claude-sonnet-4-6"
-    max_claims_per_request: int = 20
-    retriever_results_per_claim: int = 5
+    default_model: str = "claude-opus-4-7"
+    max_claims: int = 20
+    results_per_claim: int = 5
     retriever_timeout_seconds: float = 10.0
-    log_level: str = "INFO"
+    concurrency_limit: int = 5
 
 
 settings = Settings()

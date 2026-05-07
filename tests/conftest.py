@@ -1,137 +1,86 @@
-from typing import AsyncGenerator
-from unittest.mock import AsyncMock, MagicMock, patch
+from __future__ import annotations
+
+import json
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import anthropic
 import pytest
 
-from fact_checker.models.response import Classification
-from fact_checker.retriever import SearchResult
-from fact_checker.verifier import VerificationResult
+from fact_checker.models import SearchResult
+
+
+def _build_response(text: str) -> MagicMock:
+    """Create a fake anthropic.types.Message-shaped object."""
+    block = MagicMock()
+    block.text = text
+    msg = MagicMock()
+    msg.content = [block]
+    return msg
 
 
 @pytest.fixture
-def sample_claim() -> str:
-    return "The COVID-19 mRNA vaccines were authorized by the FDA in December 2020."
+def make_anthropic():
+    """Factory: returns a mocked AsyncAnthropic client whose .messages.create
+    yields the given JSON-serializable values, one per call."""
 
+    def _factory(*responses: Any) -> AsyncMock:
+        client = AsyncMock(spec=anthropic.AsyncAnthropic)
+        client.messages = AsyncMock()
+        texts = [json.dumps(r) if not isinstance(r, str) else r for r in responses]
+        if len(texts) == 1:
+            client.messages.create = AsyncMock(return_value=_build_response(texts[0]))
+        else:
+            iter_texts = iter(texts)
+            async def side(**_: Any) -> MagicMock:
+                return _build_response(next(iter_texts))
+            client.messages.create = AsyncMock(side_effect=side)
+        return client
 
-@pytest.fixture
-def sample_claim_pt() -> str:
-    return "O PIB do Brasil em 2023 foi de R$10,9 trilhões."
+    return _factory
 
 
 @pytest.fixture
 def sample_evidence() -> list[SearchResult]:
     return [
         SearchResult(
-            title="FDA Authorizes COVID-19 Vaccines",
-            url="https://www.fda.gov/emergency-use-authorization-vaccines",
-            content="The FDA issued emergency use authorization for the Pfizer-BioNTech COVID-19 vaccine in December 2020.",
+            title="FDA grants EUA for Pfizer-BioNTech vaccine",
+            url="https://www.fda.gov/news-events/press-announcements/fda-pfizer",
+            content="The FDA issued an Emergency Use Authorization for the Pfizer-BioNTech COVID-19 vaccine on December 11, 2020.",
             published_date="2020-12-11",
-            raw_score=0.95,
         ),
         SearchResult(
-            title="COVID-19 Vaccine Authorization Timeline",
-            url="https://www.cdc.gov/covid19-vaccine-authorization",
-            content="Emergency use authorization was granted for the Moderna vaccine on December 18, 2020.",
-            published_date="2020-12-18",
-            raw_score=0.90,
-        ),
-        SearchResult(
-            title="Vaccine Development History",
-            url="https://www.nih.gov/vaccine-history",
-            content="Both mRNA vaccines received EUA from the FDA within weeks of each other in December 2020.",
+            title="CDC: COVID-19 mRNA vaccines",
+            url="https://www.cdc.gov/coronavirus/2019-ncov/vaccines/different-vaccines/mrna.html",
+            content="Both the Pfizer-BioNTech and Moderna mRNA vaccines were authorized in December 2020.",
             published_date="2021-01-05",
-            raw_score=0.85,
+        ),
+        SearchResult(
+            title="NIH overview of COVID-19 vaccine timelines",
+            url="https://www.nih.gov/coronavirus/timeline",
+            content="Authorization timelines for COVID-19 vaccines, including Pfizer (Dec 11) and Moderna (Dec 18).",
+            published_date="2021-02-01",
         ),
     ]
 
 
 @pytest.fixture
-def sample_verification_true(sample_evidence: list[SearchResult]) -> VerificationResult:
-    return VerificationResult(
-        classification=Classification.TRUE,
-        explanation="Multiple authoritative sources confirm the FDA authorized mRNA vaccines in December 2020.",
-        supporting_urls=[e.url for e in sample_evidence],
-        contradicting_urls=[],
-        misinformation_patterns=[],
-        emotional_language_detected=False,
-        is_outdated=False,
-        source_agreement_count=3,
-        source_disagreement_count=0,
-    )
+def verifier_payload():
+    """Factory for constructing verifier-shaped JSON payloads."""
 
-
-@pytest.fixture
-def sample_verification_false() -> VerificationResult:
-    return VerificationResult(
-        classification=Classification.FALSE,
-        explanation="Evidence contradicts this claim.",
-        supporting_urls=[],
-        contradicting_urls=["https://www.nih.gov/vaccine-history"],
-        misinformation_patterns=[],
-        emotional_language_detected=False,
-        is_outdated=False,
-        source_agreement_count=0,
-        source_disagreement_count=2,
-    )
-
-
-@pytest.fixture
-def sample_verification_unverifiable() -> VerificationResult:
-    return VerificationResult(
-        classification=Classification.UNVERIFIABLE,
-        explanation="No sufficient evidence was found.",
-        supporting_urls=[],
-        contradicting_urls=[],
-        misinformation_patterns=[],
-        emotional_language_detected=False,
-        is_outdated=False,
-        source_agreement_count=0,
-        source_disagreement_count=0,
-    )
-
-
-@pytest.fixture
-def mock_anthropic_response_factory():
-    """Factory for creating mock Anthropic message responses."""
-
-    def _make(content: str) -> MagicMock:
-        response = MagicMock(spec=anthropic.types.Message)
-        text_block = MagicMock()
-        text_block.text = content
-        response.content = [text_block]
-        return response
+    def _make(**overrides: Any) -> dict[str, Any]:
+        base = {
+            "classification": "true",
+            "explanation": "Multiple authoritative sources confirm the claim.",
+            "supporting_urls": [],
+            "contradicting_urls": [],
+            "misinformation_patterns": [],
+            "emotional_language_detected": False,
+            "is_outdated": False,
+            "source_agreement_count": 2,
+            "source_disagreement_count": 0,
+        }
+        base.update(overrides)
+        return base
 
     return _make
-
-
-@pytest.fixture
-def mock_anthropic_client(mock_anthropic_response_factory) -> AsyncMock:
-    client = AsyncMock(spec=anthropic.AsyncAnthropic)
-    client.messages = AsyncMock()
-    client.messages.create = AsyncMock(
-        return_value=mock_anthropic_response_factory('["Sample factual claim."]')
-    )
-    return client
-
-
-@pytest.fixture
-def mock_tavily_response() -> dict:
-    return {
-        "results": [
-            {
-                "title": "FDA Authorizes COVID-19 Vaccines",
-                "url": "https://www.fda.gov/emergency-use-authorization-vaccines",
-                "content": "The FDA issued emergency use authorization in December 2020.",
-                "published_date": "2020-12-11",
-                "score": 0.95,
-            },
-            {
-                "title": "CDC Vaccine Guidance",
-                "url": "https://www.cdc.gov/covid19-vaccine-authorization",
-                "content": "CDC guidance on the COVID-19 vaccination program.",
-                "published_date": "2021-01-01",
-                "score": 0.88,
-            },
-        ]
-    }

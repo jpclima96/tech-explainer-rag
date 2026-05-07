@@ -1,51 +1,51 @@
+"""Confidence scoring — pure functions, no I/O."""
+from __future__ import annotations
+
 from datetime import datetime, timezone
-from typing import Optional
 
-from fact_checker.models.response import Classification, Source
-from fact_checker.retriever import SearchResult, credibility_score_for_url
-from fact_checker.verifier import VerificationResult
+from fact_checker.models import (
+    Classification,
+    SearchResult,
+    Source,
+    VerificationResult,
+)
+from fact_checker.retriever import credibility_score_for_url
 
-# Confidence formula weights (must sum to 1.0)
-_W_AGREEMENT = 0.35
-_W_CREDIBILITY = 0.30
-_W_RECENCY = 0.20
-_W_CONSISTENCY = 0.15
+# Weights for the confidence formula (must sum to 1.0)
+W_AGREEMENT = 0.35
+W_CREDIBILITY = 0.30
+W_RECENCY = 0.20
+W_CONSISTENCY = 0.15
 
-_OUTDATED_PENALTY = 0.75
-_UNVERIFIABLE_CAP = 0.40
+OUTDATED_PENALTY = 0.75
+UNVERIFIABLE_CAP = 0.40
+
+_DATE_FORMATS = [
+    ("%Y-%m-%d", 10),
+    ("%Y-%m-%dT%H:%M:%SZ", 20),
+    ("%Y-%m-%dT%H:%M:%S", 19),
+    ("%Y/%m/%d", 10),
+    ("%Y", 4),
+]
 
 
-def _agreement_ratio(agree: int, disagree: int) -> float:
-    total = agree + disagree
-    if total == 0:
-        return 0.0
-    return agree / total
-
-
-def _recency_score(published_date: Optional[str]) -> float:
-    if not published_date:
-        return 0.50  # unknown date → neutral
-
-    _FORMATS = [
-        ("%Y-%m-%d", 10),
-        ("%Y-%m-%dT%H:%M:%SZ", 20),
-        ("%Y-%m-%dT%H:%M:%S", 19),
-        ("%Y/%m/%d", 10),
-        ("%Y", 4),
-    ]
-    dt = None
-    for fmt, length in _FORMATS:
+def _parse_date(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    for fmt, length in _DATE_FORMATS:
         try:
-            dt = datetime.strptime(published_date[:length], fmt).replace(tzinfo=timezone.utc)
-            break
+            return datetime.strptime(raw[:length], fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
+    return None
+
+
+def recency_score(published_date: str | None) -> float:
+    """Map a published date to a recency score in [0, 1]."""
+    dt = _parse_date(published_date)
     if dt is None:
-        return 0.50  # unparseable → neutral
-
-    now = datetime.now(tz=timezone.utc)
-    age_years = (now - dt).days / 365.25
-
+        return 0.50  # neutral when unknown
+    age_years = (datetime.now(tz=timezone.utc) - dt).days / 365.25
     if age_years <= 1:
         return 1.00
     if age_years <= 3:
@@ -55,84 +55,74 @@ def _recency_score(published_date: Optional[str]) -> float:
     return 0.25
 
 
-def _mean_credibility(urls: list[str]) -> float:
-    if not urls:
-        return 0.0
-    scores = [credibility_score_for_url(u) for u in urls]
-    return sum(scores) / len(scores)
+def agreement_ratio(agree: int, disagree: int) -> float:
+    total = agree + disagree
+    return 0.0 if total == 0 else agree / total
 
 
-def _mean_recency(sources: list[SearchResult], supporting_urls: set[str]) -> float:
-    relevant = [s for s in sources if s.url in supporting_urls]
-    if not relevant:
-        return 0.0
-    scores = [_recency_score(s.published_date) for s in relevant]
-    return sum(scores) / len(scores)
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
 
 
-def _consistency_score(
-    all_sources: list[SearchResult],
-    supporting_urls: set[str],
-    contradicting_urls: set[str],
+def _consistency(
+    evidence: list[SearchResult], contradicting: set[str]
 ) -> float:
-    total = len(all_sources)
-    if total == 0:
+    if not evidence:
         return 0.0
-    contradicting = sum(1 for s in all_sources if s.url in contradicting_urls)
-    return max(0.0, (total - contradicting) / total)
+    against = sum(1 for e in evidence if e.url in contradicting)
+    return max(0.0, (len(evidence) - against) / len(evidence))
 
 
-class Scorer:
-    def compute(
-        self,
-        verification: VerificationResult,
-        all_evidence: list[SearchResult],
-    ) -> tuple[float, list[Source]]:
-        supporting_urls = set(verification.supporting_urls)
-        contradicting_urls = set(verification.contradicting_urls)
+def compute(
+    verification: VerificationResult,
+    evidence: list[SearchResult],
+) -> tuple[float, list[Source]]:
+    """Return (confidence_score, ordered Source list) for a verified claim."""
+    supporting = set(verification.supporting_urls)
+    contradicting = set(verification.contradicting_urls)
 
-        agreement = _agreement_ratio(
-            verification.source_agreement_count,
-            verification.source_disagreement_count,
-        )
-        credibility = _mean_credibility(list(supporting_urls))
-        recency = _mean_recency(all_evidence, supporting_urls)
-        consistency = _consistency_score(all_evidence, supporting_urls, contradicting_urls)
+    cred = _mean([credibility_score_for_url(u) for u in supporting])
+    rec = _mean([recency_score(e.published_date) for e in evidence if e.url in supporting])
+    agree = agreement_ratio(
+        verification.source_agreement_count,
+        verification.source_disagreement_count,
+    )
+    cons = _consistency(evidence, contradicting)
 
-        raw_score = (
-            _W_AGREEMENT * agreement
-            + _W_CREDIBILITY * credibility
-            + _W_RECENCY * recency
-            + _W_CONSISTENCY * consistency
-        )
+    score = (
+        W_AGREEMENT * agree
+        + W_CREDIBILITY * cred
+        + W_RECENCY * rec
+        + W_CONSISTENCY * cons
+    )
 
-        if verification.is_outdated:
-            raw_score *= _OUTDATED_PENALTY
+    if verification.is_outdated:
+        score *= OUTDATED_PENALTY
 
-        if verification.classification == Classification.UNVERIFIABLE:
-            raw_score = min(raw_score, _UNVERIFIABLE_CAP)
+    if verification.classification == Classification.UNVERIFIABLE:
+        score = min(score, UNVERIFIABLE_CAP)
 
-        confidence = round(max(0.0, min(1.0, raw_score)), 4)
+    confidence = round(max(0.0, min(1.0, score)), 4)
+    sources = _build_sources(evidence, supporting)
+    return confidence, sources
 
-        sources = self._build_sources(all_evidence, supporting_urls)
-        return confidence, sources
 
-    def _build_sources(
-        self, evidence: list[SearchResult], supporting_urls: set[str]
-    ) -> list[Source]:
-        seen: set[str] = set()
-        sources: list[Source] = []
-        # Supporting sources first, then the rest
-        ordered = sorted(evidence, key=lambda e: e.url not in supporting_urls)
-        for item in ordered:
-            if item.url in seen:
-                continue
-            seen.add(item.url)
-            sources.append(
-                Source(
-                    title=item.title,
-                    url=item.url,
-                    credibility_score=credibility_score_for_url(item.url),
-                )
+def _build_sources(
+    evidence: list[SearchResult], supporting: set[str]
+) -> list[Source]:
+    seen: set[str] = set()
+    out: list[Source] = []
+    # Supporting first, then everything else, deduplicated by URL.
+    ordered = sorted(evidence, key=lambda e: e.url not in supporting)
+    for item in ordered:
+        if not item.url or item.url in seen:
+            continue
+        seen.add(item.url)
+        out.append(
+            Source(
+                title=item.title or item.url,
+                url=item.url,
+                credibility_score=credibility_score_for_url(item.url),
             )
-        return sources
+        )
+    return out
